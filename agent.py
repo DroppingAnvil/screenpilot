@@ -26,6 +26,7 @@ class ScreenPilotAgent:
         self.capture = ScreenCapture()
 
         self.directive = None
+        self.negatives = []       # actions/behaviors explicitly blocked by the user
         self.plan = None          # original plan — never modified after generation
         self.working_plan = None  # runtime plan — amended as agent discovers new info
         self.vision_context = "" # task-focused hint for vision, regenerated each step
@@ -44,11 +45,14 @@ class ScreenPilotAgent:
     #  Public control methods (called by Flask routes)                    #
     # ------------------------------------------------------------------ #
 
-    def set_directive(self, directive: str) -> dict:
+    def set_directive(self, directive: str, negatives: list = None) -> dict:
         """Accept a new directive, generate a plan, scan the environment, then refine."""
         self.directive = directive
+        self.negatives = negatives or []
         self.status = "planning"
         self._log(f"New directive received: {directive}")
+        if self.negatives:
+            self._log(f"Blocked actions: {', '.join(self.negatives)}")
 
         # Check memory for relevant past actions
         past = self.memory.search_relevant(directive)
@@ -157,13 +161,13 @@ class ScreenPilotAgent:
             current_step_text = self.working_plan[self.current_step]
             self._log(f"[Step {self.current_step + 1}/{len(self.working_plan)}] Evaluating: {current_step_text}")
 
-            # Regenerate vision context when step changes
-            if self._last_context_step != self.current_step:
-                self.vision_context = self.planner.prepare_vision_context(
-                    self.directive, current_step_text
-                )
-                self._last_context_step = self.current_step
-                self._log(f"Vision context: {self.vision_context[:100]}")
+            # # Regenerate vision context when step changes (disabled — vision prompt uses no context)
+            # if self._last_context_step != self.current_step:
+            #     self.vision_context = self.planner.prepare_vision_context(
+            #         self.directive, current_step_text
+            #     )
+            #     self._last_context_step = self.current_step
+            #     self._log(f"Vision context: {self.vision_context[:100]}")
 
             # 1. Capture screen
             screenshot_b64 = self.capture.grab_base64()
@@ -201,6 +205,7 @@ class ScreenPilotAgent:
             # 3. Reasoning: feed vision report to text model to decide plan updates + final action
             reason_result = self.planner.reason_about_observation(
                 directive=self.directive,
+                negatives=self.negatives,
                 original_plan=self.plan,
                 working_plan=self.working_plan,
                 current_step=self.current_step,
@@ -213,8 +218,18 @@ class ScreenPilotAgent:
             # 4. Apply temp step insertions — deduplicate against existing plan
             insertions = reason_result.get("temp_insertions", [])
             if insertions:
+                # Normalize: model sometimes returns dicts instead of plain strings
+                flat = []
+                for s in insertions:
+                    if isinstance(s, str):
+                        flat.append(s)
+                    elif isinstance(s, dict):
+                        # Extract first string value from the dict, ignoring nested objects
+                        val = next((v for v in s.values() if isinstance(v, str) and len(v) > 3), None)
+                        if val:
+                            flat.append(val)
                 existing = set(self.working_plan)
-                new_steps = [s for s in insertions if s.strip() and s not in existing][:2]
+                new_steps = [s for s in flat if s.strip() and s not in existing][:2]
                 if new_steps:
                     insert_at = self.current_step + 1
                     with self._lock:
@@ -242,8 +257,8 @@ class ScreenPilotAgent:
                 self._log(f"Executed: {action.get('type')} -> {result}")
                 self.last_action = action
 
-            # 8. Advance step if reasoning confirmed complete — independent of action type
-            if reason_result.get("current_step_complete", False):
+            # 8. Advance step only if an action was executed this iteration
+            if result and result.get("ok") and reason_result.get("current_step_complete", False):
                 self.memory.log_action(
                     directive=self.directive,
                     step=current_step_text,

@@ -47,11 +47,12 @@ threading.Thread(target=agent.vision.warmup, daemon=True).start()
 
 @app.route("/api/directive", methods=["POST"])
 def set_directive():
-    data = request.get_json()
-    directive = (data or {}).get("directive", "").strip()
+    data = request.get_json() or {}
+    directive = data.get("directive", "").strip()
+    negatives = data.get("negatives", [])
     if not directive:
         return jsonify({"error": "directive is required"}), 400
-    result = agent.set_directive(directive)
+    result = agent.set_directive(directive, negatives)
     return jsonify(result)
 
 
@@ -529,6 +530,10 @@ HTML_UI = r"""<!DOCTYPE html>
       <textarea id="directiveInput" class="directive-input"
         placeholder="e.g. Complete the customer satisfaction survey at the current URL"></textarea>
 
+      <div class="section-label" style="margin-top:10px">Never Do <span style="font-weight:400;color:var(--muted);font-size:11px">(comma-separated)</span></div>
+      <input id="negativesInput" type="text" class="setting-input" style="width:100%;margin-bottom:4px"
+        placeholder="e.g. sign in, create account, navigate away, click ads" />
+
       <div class="btn-row">
         <button class="btn btn-primary" onclick="submitDirective()">Generate Plan</button>
       </div>
@@ -651,10 +656,12 @@ async function submitDirective() {
   // Poll during planning+scanning so screen capture and status updates appear live
   startPolling();
 
+  const negatives = document.getElementById('negativesInput').value
+    .split(',').map(s => s.trim()).filter(Boolean);
   const res = await fetch('/api/directive', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({directive: text})
+    body: JSON.stringify({directive: text, negatives})
   });
 
   stopPolling();

@@ -6,19 +6,37 @@ Primary: qwen2.5vl:7b  |  Fallback: llama3.2-vision
 import requests
 import json
 import base64
+import ctypes
 
 
-ANALYZE_PROMPT = """GOAL: {vision_context}
+def _get_dpi_scale() -> float:
+    """Return the Windows DPI scale factor (e.g. 1.25 for 125% scaling)."""
+    try:
+        hdc = ctypes.windll.user32.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+        ctypes.windll.user32.ReleaseDC(0, hdc)
+        return dpi / 96.0
+    except Exception:
+        return 1.0
 
-Describe only what you can see in this screenshot. Do not invent anything.
+
+ANALYZE_PROMPT = """Describe only what you can see in this screenshot. Do not invent anything.
 
 What is on this screen? What text is visible? What can be interacted with? What stands out most? What should happen next?"""
 
 
-COORD_PROMPT = """Find the center pixel coordinates of this UI element in the screenshot: {target}
+COORD_PROMPT = """Look at this screenshot ({width}x{height} pixels) and find: {target}
 
-Reply with only this JSON: {{"x": <pixels from left edge>, "y": <pixels from top edge>}}
-Image dimensions: {width}x{height} pixels."""
+First describe where it is:
+- Vertical: is it in the top third, middle third, or bottom third of the screen?
+- Horizontal: is it on the left, center, or right?
+- Is it near any edge?
+
+Then give its center as normalized coordinates (0.0=top/left, 1.0=bottom/right).
+Do NOT return (0.5, 0.5) unless the element is literally at the center of the screen.
+
+Reply with ONLY this JSON:
+{{"position": "describe where it is", "x": 0.0, "y": 0.0}}"""
 
 
 class VisionModel:
@@ -27,7 +45,9 @@ class VisionModel:
         self.model = config.get("vision_model_primary", "qwen2.5vl:7b")
         self.screen_width = config.get("screen_width", 1920)
         self.screen_height = config.get("screen_height", 1080)
+        self.dpi_scale = config.get("dpi_scale", _get_dpi_scale())
         self.timeout = config.get("vision_timeout", 120)
+        print(f"[Vision] Screen {self.screen_width}x{self.screen_height} @ DPI scale {self.dpi_scale}x")
 
     def warmup(self):
         """Pre-load the vision model into VRAM without inference.
@@ -47,7 +67,7 @@ class VisionModel:
             print(f"[Vision] Warmup failed: {e}")
 
     def analyze(self, screenshot_b64: str, directive: str = "", vision_context: str = "") -> dict:
-        prompt = ANALYZE_PROMPT.format(vision_context=vision_context or "Complete the task visible on screen.")
+        prompt = ANALYZE_PROMPT
         raw = self._call_model(prompt, screenshot_b64)
         if not raw:
             return {"report": "", "loading": True}
@@ -63,18 +83,26 @@ class VisionModel:
         raw = self._call_model(prompt, screenshot_b64)
         print(f"[Vision] Coord raw: {raw[:300]}")
 
-        # Parse JSON pixel coords {"x": 123, "y": 456}
         try:
             start = raw.find("{")
             end = raw.rfind("}") + 1
             if start != -1 and end > start:
                 result = json.loads(raw[start:end])
-                x, y = result.get("x"), result.get("y")
-                if x is not None and y is not None:
-                    print(f"[Vision] Coords -> ({x}, {y})")
-                    return {"x": int(x), "y": int(y)}
-        except Exception:
-            pass
+                nx, ny = result.get("x"), result.get("y")
+                if nx is not None and ny is not None:
+                    nx, ny = float(nx), float(ny)
+                    # Normalized (0.0-1.0) → physical screen pixels
+                    # mss and pyautogui both operate in physical pixels on this system
+                    if 0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0:
+                        x = int(nx * self.screen_width)
+                        y = int(ny * self.screen_height)
+                    else:
+                        x = int(nx)
+                        y = int(ny)
+                    print(f"[Vision] Normalized ({nx:.3f}, {ny:.3f}) -> screen ({x}, {y})")
+                    return {"x": x, "y": y}
+        except Exception as e:
+            print(f"[Vision] Coord parse error: {e}")
 
         print(f"[Vision] Could not parse coordinates from: {raw[:200]}")
         return {"x": None, "y": None}
