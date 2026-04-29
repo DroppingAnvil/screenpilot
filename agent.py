@@ -6,7 +6,9 @@ import time
 import threading
 import base64
 import json
+import re
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from planner import Planner
@@ -14,6 +16,36 @@ from vision import VisionModel
 from executor import ActionExecutor
 from memory import Memory
 from capture import ScreenCapture
+import ocr as ocr_finder
+
+
+_VISUAL_ONLY_WORDS = {
+    "picture", "photo", "image", "thumbnail", "avatar", "portrait",
+    "logo", "icon", "symbol", "graphic", "illustration",
+    "video", "gif", "banner", "cover", "artwork",
+}
+
+
+def _is_ocr_searchable(target: str) -> bool:
+    """Return False if the target describes a visual/image element that has no OCR-readable text."""
+    words = set(target.lower().split())
+    return not bool(words & _VISUAL_ONLY_WORDS)
+
+
+def _clean_ocr_target(raw: str) -> str:
+    """Normalize a target_description to plain label text suitable for OCR matching."""
+    t = raw.strip()
+    # Strip leading action verb + optional article: "Click the X" / "Click X" → "X"
+    t = re.sub(r'^(click|tap|select|press|find|open|type in|type)\s+(the\s+|a\s+|an\s+)?', '', t, flags=re.IGNORECASE)
+    # Strip remaining leading article
+    t = re.sub(r'^(the|a|an)\s+', '', t, flags=re.IGNORECASE)
+    # Strip parenthetical qualifiers: "(button)", "(video thumbnail)"
+    t = re.sub(r'\s*\([^)]*\)', '', t)
+    # Strip trailing positional phrases: "in the top right", "at the bottom of the screen"
+    t = re.sub(r'\s+(in|at|on|near)\s+the\s+.+$', '', t, flags=re.IGNORECASE)
+    # Strip trailing UI descriptor words that won't appear as OCR text
+    t = re.sub(r'\s+(button|icon|link|field|input|box|dropdown|menu|tab|label|checkbox|radio|toggle|bar|logo)s?$', '', t, flags=re.IGNORECASE)
+    return t.strip()
 
 
 class ScreenPilotAgent:
@@ -39,6 +71,8 @@ class ScreenPilotAgent:
         self.last_screen_b64 = None
         self.last_vision = None
         self.log_entries = []
+        self._stuck_count = 0
+        self._prev_vision_text = ""
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
@@ -79,9 +113,7 @@ class ScreenPilotAgent:
                 self.last_vision = vision_result
             self._log(f"Environment scan complete. Report length: {len(vision_result.get('report', ''))} chars")
 
-            # Step 3: refine plan based on what is actually on screen
-            plan = self.planner.refine_plan(directive, plan, vision_result)
-            self._log(f"Plan refined to {len(plan)} steps")
+            # Step 3: (refine_plan disabled — live reasoning loop adapts to actual screen)
         except Exception as e:
             self._log(f"Environment scan failed, using initial plan: {e}")
 
@@ -151,15 +183,16 @@ class ScreenPilotAgent:
                 time.sleep(0.5)
                 continue
 
-            if self.current_step >= len(self.working_plan):
-                self._log("All working plan steps complete.")
-                self.memory.store_completion(self.directive, self.working_plan)
-                self.status = "complete"
-                self.running = False
-                break
-
-            current_step_text = self.working_plan[self.current_step]
-            self._log(f"[Step {self.current_step + 1}/{len(self.working_plan)}] Evaluating: {current_step_text}")
+            plan_exhausted = self.current_step >= len(self.working_plan)
+            current_step_text = (
+                self.working_plan[self.current_step]
+                if not plan_exhausted
+                else "(plan steps complete — continue based on directive)"
+            )
+            if plan_exhausted:
+                self._log("Plan steps exhausted — running directive-only until task complete")
+            else:
+                self._log(f"[Step {self.current_step + 1}/{len(self.working_plan)}] Evaluating: {current_step_text}")
 
             # # Regenerate vision context when step changes (disabled — vision prompt uses no context)
             # if self._last_context_step != self.current_step:
@@ -175,6 +208,7 @@ class ScreenPilotAgent:
                 self.last_screen_b64 = screenshot_b64
 
             # 2. Vision: read the screen, describe state and suggest action
+            prev_vision = self.last_vision  # capture before overwriting
             vision_result = self.vision.analyze(screenshot_b64, self.directive, self.vision_context)
             with self._lock:
                 self.last_vision = vision_result
@@ -202,6 +236,18 @@ class ScreenPilotAgent:
                 time.sleep(interval)
                 continue
 
+            # Stuck detection: compare current report text to previous
+            # If screen text is <50% different, count as stuck iteration
+            if self._prev_vision_text:
+                similarity = SequenceMatcher(None, self._prev_vision_text, report).ratio()
+                if similarity >= 0.5:  # screen hasn't changed meaningfully
+                    self._stuck_count += 1
+                else:
+                    self._stuck_count = 0
+            self._prev_vision_text = report
+            if self._stuck_count > 0:
+                self._log(f"Screen unchanged for {self._stuck_count} iteration(s)")
+
             # 3. Reasoning: feed vision report to text model to decide plan updates + final action
             reason_result = self.planner.reason_about_observation(
                 directive=self.directive,
@@ -210,6 +256,8 @@ class ScreenPilotAgent:
                 working_plan=self.working_plan,
                 current_step=self.current_step,
                 vision_result=vision_result,
+                prev_vision_result=prev_vision,
+                stuck_count=self._stuck_count,
             )
 
             reasoning = reason_result.get("reasoning", "")
@@ -237,37 +285,73 @@ class ScreenPilotAgent:
                             self.working_plan.insert(insert_at + i, new_step)
                     self._log(f"Working plan updated: +{len(new_steps)} temp step(s) inserted")
 
-            action = reason_result.get("action")
-            result = None
+            # Support both "actions" (list) and legacy "action" (single)
+            raw_actions = reason_result.get("actions") or []
+            if not raw_actions and reason_result.get("action"):
+                raw_actions = [reason_result["action"]]
 
-            if not action or action.get("type") == "wait":
+            result = None
+            executed_count = 0
+
+            if not raw_actions or all(a.get("type") == "wait" for a in raw_actions):
                 self._log("No action ready, waiting...")
             else:
-                # 6. Resolve coordinates for click actions
-                if action.get("type") in ("click", "double_click", "right_click"):
-                    if not action.get("x") or not action.get("y"):
-                        coords = self.vision.find_coordinates(
-                            screenshot_b64,
-                            action.get("target_description", current_step_text)
-                        )
-                        action.update(coords)
+                for action in raw_actions:
+                    if not action or action.get("type") == "wait":
+                        continue
 
-                # 7. Execute
-                result = self.executor.execute(action)
-                self._log(f"Executed: {action.get('type')} -> {result}")
-                self.last_action = action
+                    # 6. Resolve coordinates for click/select actions
+                    if action.get("type") in ("click", "select", "double_click", "right_click"):
+                        if not action.get("x") or not action.get("y"):
+                            raw_target = action.get("target_description", "")
+                            if raw_target:
+                                target = _clean_ocr_target(raw_target)
+                                coords = ocr_finder.find_text_coords(screenshot_b64, target)
+                                if not coords:
+                                    coords = self.vision.find_coordinates(screenshot_b64, target)
+                                action.update(coords)
 
-            # 8. Advance step only if an action was executed this iteration
-            if result and result.get("ok") and reason_result.get("current_step_complete", False):
+                    # If a click still has no coords, abort the whole sequence —
+                    # subsequent type/tab actions would land in the wrong place
+                    if action.get("type") in ("click", "select", "double_click", "right_click"):
+                        if not action.get("x") or not action.get("y"):
+                            self._log(f"Sequence aborted — no coords for: {action.get('target_description')}")
+                            break
+
+                    # 7. Execute
+                    result = self.executor.execute(action)
+                    self._log(f"Executed: {action.get('type')} -> {result}")
+                    self.last_action = action
+                    if result and result.get("ok"):
+                        executed_count += 1
+
+            # 8. Check if reasoning considers directive complete
+            if reason_result.get("directive_complete"):
+                self._log("Directive marked complete by reasoning.")
+                self.memory.store_completion(self.directive, self.working_plan)
+                self.status = "complete"
+                self.running = False
+                break
+
+            # 9. Advance step if a type action succeeded OR multiple actions ran (form fill sequence)
+            #    A lone click on Continue may not have changed the page — don't advance for that alone
+            action_types = [a.get("type") for a in raw_actions if a]
+            meaningful = executed_count > 0 and (
+                len(raw_actions) > 1 or          # multi-action sequence (form fill)
+                "type" in action_types or         # text was actually entered
+                "key" in action_types or          # keyboard action
+                "scroll" in action_types          # scroll happened
+            )
+            if meaningful and not plan_exhausted:
                 self.memory.log_action(
                     directive=self.directive,
                     step=current_step_text,
-                    action=action or {"type": "wait"},
+                    action=self.last_action or {"type": "wait"},
                     result=result or {}
                 )
                 with self._lock:
                     self.current_step += 1
-                self._log(f"Step complete. Advancing to step {self.current_step + 1}")
+                self._log(f"{executed_count} action(s) executed. Advancing to step {self.current_step + 1}")
 
             time.sleep(interval)
 

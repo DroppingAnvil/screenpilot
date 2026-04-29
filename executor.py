@@ -31,7 +31,7 @@ class ActionExecutor:
             return {"ok": True, "dry_run": True}
 
         try:
-            if atype == "click":
+            if atype in ("click", "select"):
                 return self._click(action, button="left")
             elif atype == "double_click":
                 return self._double_click(action)
