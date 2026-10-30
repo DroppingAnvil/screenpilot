@@ -1,6 +1,7 @@
 # ScreenPilot
 
 A local computer automation agent. Give it a directive, it generates a plan, watches your screen via screenshots, and executes mouse/keyboard actions to complete the task.
+This was a test of abstracted computer use, similar in goal to OpenAI's Atlas and Claude in Chrome. Those tools use only the browser's debugger and page internals, which limits them to the browser. This system works from the visual layer of the whole display, so it can do anything a user could in any app with no extra code per app. It is slow, but it runs on a low-tier RTX 3050 using under 8GB of VRAM, with no external models or MCP. This approach also is more difficult to detect as AI or automation as it uses no code level tools and only what the user could actually do. For now this project is expected to receive no more updates but contributions are welcome.
 
 ## Stack
 
